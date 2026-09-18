@@ -3035,6 +3035,13 @@ func (ms *MutableStateImpl) AddWorkflowExecutionStartedEventWithOptions(
 		return nil, ms.createInternalServerError(opTag)
 	}
 
+	if err := ms.validateCallbackAdditions(chasmworkflow.CallbackAddition{
+		RequestID: startRequest.StartRequest.GetRequestId(),
+		Callbacks: startRequest.StartRequest.GetCompletionCallbacks(),
+	}); err != nil {
+		return nil, err
+	}
+
 	event := ms.hBuilder.AddWorkflowExecutionStartedEvent(
 		ms.executionState.StartTime.AsTime(),
 		startRequest,
@@ -3491,10 +3498,49 @@ func (ms *MutableStateImpl) addUpdateCallbacksChasm(
 		return err
 	}
 
+	return wf.AddUpdateCompletionCallbacks(ctx, event.EventTime, updateID, requestID, updateCallbacks)
+}
+
+// validateCallbackAdditions checks that the given callbacks can be attached to this execution
+// without breaching the aggregate limits. It is a no-op for executions whose callbacks are
+// still held by the HSM tree, which enforces its own limit while attaching.
+//
+// Validation deliberately lives on the write path instead of alongside the attach in the
+// Apply* functions: MutableStateRebuilder drives those during NDC replication, history
+// import, and reset, where the event was already committed on another cluster. Rejecting it
+// there stalls the replication task rather than protecting anything, and lowering a limit
+// would retroactively wedge every execution already above it.
+func (ms *MutableStateImpl) validateCallbackAdditions(additions ...chasmworkflow.CallbackAddition) error {
+	if !ms.chasmCallbacksEnabled() {
+		return nil
+	}
 	nsName := ms.GetNamespaceEntry().Name().String()
-	maxCallbacksPerWorkflow := ms.config.MaxCallbacksPerWorkflow(nsName)
-	maxCallbacksPerUpdateID := ms.config.MaxCallbacksPerUpdateID(nsName)
-	return wf.AddUpdateCompletionCallbacks(ctx, event.EventTime, updateID, requestID, updateCallbacks, maxCallbacksPerWorkflow, maxCallbacksPerUpdateID)
+	updateCallbacksEnabled := ms.config.EnableWorkflowUpdateCallbacks(nsName)
+
+	attaching := make([]chasmworkflow.CallbackAddition, 0, len(additions))
+	for _, addition := range additions {
+		// Skip what addUpdateCallbacks/addCompletionCallbacks would drop anyway.
+		if len(addition.Callbacks) == 0 || (addition.UpdateID != "" && !updateCallbacksEnabled) {
+			continue
+		}
+		attaching = append(attaching, addition)
+	}
+	if len(attaching) == 0 {
+		return nil
+	}
+
+	ms.EnsureChasmWorkflowComponent(context.Background())
+	wf, ctx, err := ms.ChasmWorkflowComponent(context.Background())
+	if err != nil {
+		return err
+	}
+	return wf.ValidateCallbackAdditions(
+		ctx,
+		attaching,
+		nsName,
+		ms.shard.CallbackValidator(),
+		ms.config.MaxCallbacksPerUpdateID(nsName),
+	)
 }
 
 func (ms *MutableStateImpl) addCompletionCallbacks(
@@ -3524,6 +3570,12 @@ func (ms *MutableStateImpl) addCompletionCallbacksHsm(
 ) error {
 	coll := callbacks.MachineCollection(ms.HSM())
 	maxCallbacksPerWorkflow := ms.config.MaxCallbacksPerWorkflow(ms.GetNamespaceEntry().Name().String())
+	// BUG: This limit is checked from an Apply* function, which MutableStateRebuilder also
+	// drives during NDC replication, history import, and reset. If the check fails there (say
+	// MaxCallbacksPerWorkflow was lowered after the callbacks were attached) it rejects an
+	// event another cluster already committed, stalling the replication task or failing the
+	// reapply rather than protecting anything. The CHASM path validates on the write path
+	// instead; see validateCallbackAdditions.
 	if len(completionCallbacks)+coll.Size() > maxCallbacksPerWorkflow {
 		return serviceerror.NewFailedPreconditionf(
 			"cannot attach more than %d callbacks to a workflow (%d callbacks already attached)",
@@ -3575,8 +3627,7 @@ func (ms *MutableStateImpl) addCompletionCallbacksChasm(
 		return err
 	}
 
-	maxCallbacksPerWorkflow := ms.config.MaxCallbacksPerExecution(ms.GetNamespaceEntry().Name().String())
-	return wf.AddCompletionCallbacks(ctx, event.EventTime, requestID, completionCallbacks, maxCallbacksPerWorkflow)
+	return wf.AddCompletionCallbacks(ctx, event.EventTime, requestID, completionCallbacks)
 }
 
 // AddFirstWorkflowTaskScheduled adds the first workflow task scheduled event unless it should be delayed as indicated
@@ -5685,6 +5736,13 @@ func (ms *MutableStateImpl) AddWorkflowExecutionUpdateAdmittedEvent(request *upd
 	if err := ms.checkMutability(tag.WorkflowActionUpdateAdmitted); err != nil {
 		return nil, err
 	}
+	if err := ms.validateCallbackAdditions(chasmworkflow.CallbackAddition{
+		UpdateID:  request.GetMeta().GetUpdateId(),
+		RequestID: request.GetRequestId(),
+		Callbacks: request.GetCompletionCallbacks(),
+	}); err != nil {
+		return nil, err
+	}
 	event, batchId := ms.hBuilder.AddWorkflowExecutionUpdateAdmittedEvent(request, origin)
 	if err := ms.ApplyWorkflowExecutionUpdateAdmittedEvent(event, batchId); err != nil {
 		return nil, err
@@ -5769,6 +5827,13 @@ func (ms *MutableStateImpl) AddWorkflowExecutionUpdateAcceptedEvent(
 	acceptedRequest *updatepb.Request,
 ) (*historypb.HistoryEvent, error) {
 	if err := ms.checkMutability(tag.WorkflowActionUpdateAccepted); err != nil {
+		return nil, err
+	}
+	if err := ms.validateCallbackAdditions(chasmworkflow.CallbackAddition{
+		UpdateID:  updateID,
+		RequestID: acceptedRequest.GetRequestId(),
+		Callbacks: acceptedRequest.GetCompletionCallbacks(),
+	}); err != nil {
 		return nil, err
 	}
 	event := ms.hBuilder.AddWorkflowExecutionUpdateAcceptedEvent(updateID, acceptedRequestMessageID, acceptedRequestSequencingEventID, acceptedRequest)
@@ -5957,6 +6022,22 @@ func (ms *MutableStateImpl) AddWorkflowExecutionOptionsUpdatedEvent(
 ) (*historypb.HistoryEvent, error) {
 	if err := ms.checkMutability(tag.WorkflowActionWorkflowOptionsUpdated); err != nil {
 		return nil, err
+	}
+	if len(attachCompletionCallbacks) > 0 || len(workflowUpdateOptions) > 0 {
+		additions := []chasmworkflow.CallbackAddition{{
+			RequestID: attachRequestID,
+			Callbacks: attachCompletionCallbacks,
+		}}
+		for _, updateOptions := range workflowUpdateOptions {
+			additions = append(additions, chasmworkflow.CallbackAddition{
+				UpdateID:  updateOptions.GetUpdateId(),
+				RequestID: updateOptions.GetAttachedRequestId(),
+				Callbacks: updateOptions.GetAttachedCompletionCallbacks(),
+			})
+		}
+		if err := ms.validateCallbackAdditions(additions...); err != nil {
+			return nil, err
+		}
 	}
 	event := ms.hBuilder.AddWorkflowExecutionOptionsUpdatedEvent(
 		versioningOverride,
