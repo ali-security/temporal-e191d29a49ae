@@ -1,12 +1,7 @@
 name: Build and Publish
 
 on:
-  push:
-    branches:
-      - main
-      - cloud/*
-      - feature/*
-      - release/*
+  workflow_dispatch:
 
 permissions:
   contents: read

@@ -1,9 +1,6 @@
 name: CI Success Report
 
 on:
-  schedule:
-    # Run on Tuesdays at noon Eastern time (5 PM UTC)
-    - cron: '0 17 * * 2'
   workflow_dispatch:
     inputs:
       days:

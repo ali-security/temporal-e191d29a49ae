@@ -1,10 +1,7 @@
 name: Features Integration
 
 on: # rebuild any PRs and main branch changes
-  pull_request:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions: read-all
 

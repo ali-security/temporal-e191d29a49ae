@@ -1,13 +1,12 @@
 name: All Tests
 
 on:
-  pull_request:
-  push:
-    branches:
-      - main
-      - cloud/*
-      - feature/*
-      - release/*
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional go test -run regex to narrow the unit/integration tests"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -24,12 +23,77 @@ env:
   DOCKER_COMPOSE_FILE: ./develop/github/docker-compose.yml
   TEMPORAL_VERSION_CHECK_DISABLED: 1
   MAX_TEST_ATTEMPTS: 3
-  SHARD_COUNT: 3 # NOTE: must match shard count in optimize-test-sharding.yml
+  # Fork runs on 16GB standard arm runners (upstream: 8-core); 3 shards OOM the -race cass_es functional binary.
+  SHARD_COUNT: 6 # NOTE: must match shard count in optimize-test-sharding.yml
+  # Prints per-attempt and final pass/fail counts from the merged JUnit report written by tools/testrunner.
+  SEAL_JUNIT_SUMMARY_PY: |
+    import glob, re, sys
+    import xml.etree.ElementTree as ET
+
+    SUF = re.compile(r" \(retry (\d+)\)(?: \(final\))?$")
+
+
+    def split(name):
+        name = name or ""
+        m = SUF.search(name)
+        if not m:
+            return name, 1
+        return name[: m.start()], int(m.group(1)) + 1
+
+
+    files = sorted(f for f in glob.glob(".testoutput/junit.*.xml") if not f.endswith("junit.crash.xml"))
+    if not files:
+        print("[seal-test-summary] no JUnit reports found under .testoutput/")
+        sys.exit(1)
+    results = {}
+    alerts = []
+    for path in files:
+        for suite in ET.parse(path).getroot().iter("testsuite"):
+            sname, _ = split(suite.get("name"))
+            for tc in suite.iter("testcase"):
+                if sname == "ALERTS":
+                    alerts.append(tc.get("name"))
+                    continue
+                cname, attempt = split(tc.get("name"))
+                if tc.find("failure") is not None or tc.find("error") is not None:
+                    status = "failed"
+                elif tc.find("skipped") is not None:
+                    status = "skipped"
+                else:
+                    status = "passed"
+                results.setdefault((sname, cname), {})[attempt] = status
+    per_attempt = {}
+    for runs in results.values():
+        for attempt, status in runs.items():
+            per_attempt.setdefault(attempt, {"passed": 0, "skipped": 0, "failed": 0})[status] += 1
+    for attempt in sorted(per_attempt):
+        c = per_attempt[attempt]
+        label = "initial run" if attempt == 1 else "re-run of the previous attempt's failures"
+        print(f"[seal-test-summary] attempt {attempt} ({label}): {sum(c.values())} tests, {c['passed']} passed, {c['skipped']} skipped, {c['failed']} failed")
+    final = {k: runs[max(runs)] for k, runs in results.items()}
+    passed = sum(s == "passed" for s in final.values())
+    skipped = sum(s == "skipped" for s in final.values())
+    failed = sorted(k for k, s in final.items() if s == "failed")
+    retried = sorted(k for k, runs in results.items() if len(runs) > 1 and runs[max(runs)] == "passed")
+    print(f"[seal-test-summary] FINAL RESULT: {len(final)} tests, {passed} passed, {skipped} skipped, {len(failed)} failed")
+    if not final:
+        print("[seal-test-summary] ERROR: the JUnit report contains no test results")
+        sys.exit(1)
+    if retried:
+        print(f"[seal-test-summary] {len(retried)} test(s) failed on an earlier attempt and passed when re-run by upstream's tools/testrunner (--max-attempts):")
+        for s, c in retried:
+            print(f"[seal-test-summary]   passed on retry: {s} {c}")
+    for s, c in failed:
+        print(f"[seal-test-summary]   FAILED: {s} {c}")
+    for a in alerts:
+        print(f"[seal-test-summary]   testrunner alert: {a}")
+    sys.exit(1 if failed else 0)
 
 jobs:
   test-setup:
     name: Test setup
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       job_matrix: ${{ steps.build_matrix.outputs.job_matrix }}
       full_test_reason: ${{ steps.determine_scope.outputs.full_test_reason }}
@@ -156,8 +220,9 @@ jobs:
               sharded: true
             smoke:
               cmd: make functional-test-coverage
-              test_timeout: 5m
-              github_timeout: 10
+              # 5m/10m is too short on the fork's 4-core runner: -race compile alone eats the 5m budget.
+              test_timeout: 12m
+              github_timeout: 17
               test_args: '"-run=TestActivityTestSuite|TestSignalWorkflowTestSuite|TestWorkflowTestSuite"'
             ndc:
               cmd: make functional-test-ndc-coverage
@@ -215,6 +280,7 @@ jobs:
     name: Pre-build for cache
     needs: test-setup
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
@@ -252,6 +318,7 @@ jobs:
     name: Misc checks
     needs: [pre-build, test-setup]
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
@@ -291,6 +358,7 @@ jobs:
     name: Unit test
     needs: [pre-build, test-setup]
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
@@ -316,11 +384,22 @@ jobs:
 
       - name: Run unit tests
         timeout-minutes: 20
-        run: TEST_TIMEOUT=15m ./develop/github/monitor_test.sh make unit-test-coverage
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            TEST_ARGS="\"-run=${TEST_FILTER}\"" TEST_TIMEOUT=15m ./develop/github/monitor_test.sh make unit-test-coverage
+          else
+            TEST_TIMEOUT=15m ./develop/github/monitor_test.sh make unit-test-coverage
+          fi
+
+      - name: Summarize test results
+        if: ${{ !cancelled() }}
+        run: python3 -c "$SEAL_JUNIT_SUMMARY_PY"
 
       - name: Print memory snapshot
         if: always()
-        run: cat /tmp/memory_snapshot.txt || true
+        run: if [ -f /tmp/memory_snapshot.txt ]; then cat /tmp/memory_snapshot.txt; fi
 
       - name: Generate crash report
         if: failure() # if the tests failed, we would expect one JUnit XML report per attempt; otherwise it must have crashed
@@ -337,22 +416,6 @@ jobs:
           check_annotations: false
           annotate_only: true
           skip_annotations: true
-
-      - name: Upload code coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: unit-test
-
-      - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: unit-test
-          report_type: test_results
 
       - name: Get job ID
         id: get_job_id
@@ -375,6 +438,7 @@ jobs:
     name: Integration test
     needs: [pre-build, test-setup]
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v6
         with:
@@ -416,11 +480,22 @@ jobs:
 
       - name: Run integration test
         timeout-minutes: 15
-        run: ./develop/github/monitor_test.sh make integration-test-coverage
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          if [ -n "$TEST_FILTER" ]; then
+            TEST_ARGS="\"-run=${TEST_FILTER}\"" ./develop/github/monitor_test.sh make integration-test-coverage
+          else
+            ./develop/github/monitor_test.sh make integration-test-coverage
+          fi
+
+      - name: Summarize test results
+        if: ${{ !cancelled() }}
+        run: python3 -c "$SEAL_JUNIT_SUMMARY_PY"
 
       - name: Print memory snapshot
         if: always()
-        run: cat /tmp/memory_snapshot.txt || true
+        run: if [ -f /tmp/memory_snapshot.txt ]; then cat /tmp/memory_snapshot.txt; fi
 
       - name: Generate crash report
         if: failure() # if the tests failed, we would expect one JUnit XML report per attempt; otherwise it must have crashed
@@ -437,22 +512,6 @@ jobs:
           check_annotations: false
           annotate_only: true
           skip_annotations: true
-
-      - name: Upload code coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: integration-test
-
-      - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: integration-test
-          report_type: test_results
 
       - name: Get job ID
         id: get_job_id
@@ -487,6 +546,7 @@ jobs:
       matrix:
         include: ${{ fromJson(needs.test-setup.outputs.job_matrix) }}
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 55
     env:
       PERSISTENCE_TYPE: ${{ matrix.persistence_type }}
       PERSISTENCE_DRIVER: ${{ matrix.persistence_driver }}
@@ -553,13 +613,17 @@ jobs:
           TEMPORAL_TEST_LOG_FILE: ${{ github.workspace }}/.testoutput/debug.log
           TEMPORAL_TEST_LOG_LEVEL: info
 
+      - name: Summarize test results
+        if: ${{ !cancelled() }}
+        run: python3 -c "$SEAL_JUNIT_SUMMARY_PY"
+
       - name: Dump container logs
         if: ${{ failure() && toJson(matrix.containers) != '[]' }}
         run: docker compose -f ${{ env.DOCKER_COMPOSE_FILE }} logs --no-color
 
       - name: Print memory snapshot
         if: always()
-        run: cat /tmp/memory_snapshot.txt || true
+        run: if [ -f /tmp/memory_snapshot.txt ]; then cat /tmp/memory_snapshot.txt; fi
 
       - name: Generate crash report
         if: failure() # if the tests failed, we would expect one JUnit XML report per attempt; otherwise it must have crashed
@@ -576,22 +640,6 @@ jobs:
           check_annotations: false
           annotate_only: true
           skip_annotations: true
-
-      - name: Upload code coverage to Codecov
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: functional-test
-
-      - name: Upload test results to Codecov
-        if: ${{ !cancelled() }}
-        uses: codecov/codecov-action@v5
-        with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          directory: ./.testoutput
-          flags: functional-test
-          report_type: test_results
 
       - name: Upload test results to GitHub
         # Can't pin to major because the action linter doesn't recognize the include-hidden-files flag.
@@ -616,6 +664,7 @@ jobs:
     name: Mixed brain test
     needs: [pre-build, test-setup]
     runs-on: ${{ needs.test-setup.outputs.runner_arm }}
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
         with:
@@ -659,19 +708,75 @@ jobs:
 
       - name: Print memory snapshot
         if: always()
-        run: cat /tmp/memory_snapshot.txt || true
+        run: if [ -f /tmp/memory_snapshot.txt ]; then cat /tmp/memory_snapshot.txt; fi
 
       - name: Print current server logs
         if: always()
-        run: cat .testoutput/mixedbrain_process-current.log || true
+        run: if [ -f .testoutput/mixedbrain_process-current.log ]; then cat .testoutput/mixedbrain_process-current.log; fi
 
       - name: Print release server logs
         if: always()
-        run: cat .testoutput/mixedbrain_process-release.log || true
+        run: if [ -f .testoutput/mixedbrain_process-release.log ]; then cat .testoutput/mixedbrain_process-release.log; fi
 
       - name: Print Omes logs
         if: always()
-        run: cat .testoutput/mixedbrain_omes.log || true
+        run: if [ -f .testoutput/mixedbrain_omes.log ]; then cat .testoutput/mixedbrain_omes.log; fi
+
+  module-zip:
+    name: Build module zip
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ env.COMMIT }}
+          path: src
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: "src/go.mod"
+          cache: false
+
+      - name: Create module zip with golang.org/x/mod/zip
+        run: |
+          mkdir -p "$RUNNER_TEMP/helper" "$RUNNER_TEMP/out"
+          cd "$RUNNER_TEMP/helper"
+          go mod init helper
+          go get golang.org/x/mod@v0.24.0
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+              "log"
+              "os"
+
+              "golang.org/x/mod/module"
+              "golang.org/x/mod/zip"
+          )
+
+          func main() {
+              dir, path, version, out := os.Args[1], os.Args[2], os.Args[3], os.Args[4]
+              f, err := os.Create(out)
+              if err != nil {
+                  log.Fatal(err)
+              }
+              defer f.Close()
+              if err := zip.CreateFromDir(f, module.Version{Path: path, Version: version}, dir); err != nil {
+                  log.Fatal(err)
+              }
+          }
+          EOF
+          go build -o create_mod .
+          ./create_mod "$GITHUB_WORKSPACE/src" go.temporal.io/server v1.31.0 "$RUNNER_TEMP/out/v1.31.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v1.31.0.zip" | tail -1
+
+      - name: Upload module zip
+        uses: actions/upload-artifact@v6
+        with:
+          name: go-module-zip
+          path: ${{ runner.temp }}/out/v1.31.0.zip
+          if-no-files-found: error
 
   test-status:
     if: always()
@@ -681,7 +786,9 @@ jobs:
       - unit-test
       - integration-test
       - functional-test
+      - module-zip
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       RESULTS: ${{ toJSON(needs.*.result) }}
     steps:
@@ -694,12 +801,10 @@ jobs:
 
   notify-failure:
     name: Notify Slack on Failure
-    if: |
-      always() &&
-      github.ref == 'refs/heads/main' &&
-      needs.test-status.result == 'failure'
+    if: false
     needs: test-status
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read

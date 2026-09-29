@@ -1,8 +1,6 @@
 name: Auto-approve temporal-cicd[bot] PRs on cloud release branches
 on:
-  pull_request:
-    branches:
-      - cloud/**
+  workflow_dispatch:
 permissions:
   contents: write
   pull-requests: write
