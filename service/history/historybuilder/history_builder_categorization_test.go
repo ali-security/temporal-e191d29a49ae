@@ -247,6 +247,35 @@ func TestHistoryBuilder_FlushBufferToCurrentBatch(t *testing.T) {
 		}
 	})
 
+	t.Run("per-update requestID should be wired into requestIDToEventID map after flush", func(t *testing.T) {
+		nextEventID := int64(12)
+		hb := newHistoryBuilderFromConfig(builderConfig{nextEventId: nextEventID})
+		// A duplicate Update records its requestID per update, not in AttachedRequestId.
+		optionsEvent := hb.AddWorkflowExecutionOptionsUpdatedEvent(
+			nil, false, "", nil, nil, "", nil, nil, false,
+			[]*historypb.WorkflowExecutionOptionsUpdatedEventAttributes_WorkflowUpdateOptionsUpdate{{
+				UpdateId:          "update-id",
+				AttachedRequestId: "update-request-id",
+			}},
+		)
+		if optionsEvent.EventId != common.BufferedEventID {
+			t.Fatalf("expected options updated event to be buffered, got event id %d", optionsEvent.EventId)
+		}
+
+		_, requestIDToEventID := hb.FlushBufferToCurrentBatch()
+
+		if optionsEvent.EventId != nextEventID {
+			t.Errorf("expected options updated event id %d after flush, got %d", nextEventID, optionsEvent.EventId)
+		}
+		eventID, ok := requestIDToEventID["update-request-id"]
+		if !ok {
+			t.Fatal("update requestID not found in requestIDToEventID map after flush")
+		}
+		if eventID != nextEventID {
+			t.Errorf("expected requestIDToEventID[update-request-id] == %d, got %d", nextEventID, eventID)
+		}
+	})
+
 	t.Run("when there is ACTIVITY_TASK_COMPLETED event will move it to the end", func(t *testing.T) {
 		hb := newHistoryBuilderFromConfig(builderConfig{nextEventId: 12})
 		hb.AddActivityTaskCompletedEvent(14, 13, "activity-completed", nil, defaultNamespace)
