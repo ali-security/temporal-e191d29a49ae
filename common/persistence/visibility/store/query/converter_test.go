@@ -3,6 +3,7 @@ package query
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -373,6 +374,42 @@ func TestQueryConverter_ConvertWhereString(t *testing.T) {
 			name: "fail malformed query",
 			in:   "AliasForKeyword01 = 'foo",
 			err:  MalformedSqlQueryErrMessage,
+		},
+
+		{
+			name: "fail deeply nested not expression",
+			in:   strings.Repeat("not ", 300) + "AliasForKeyword01 = 'foo'",
+			err:  "max nesting level reached",
+		},
+
+		{
+			name: "fail deeply nested tilde unary expression",
+			in:   "AliasForKeyword01 = " + strings.Repeat("~", 300) + "1",
+			err:  "max nesting level reached",
+		},
+
+		{
+			name: "fail deeply nested minus unary expression",
+			in:   "AliasForKeyword01 = " + strings.Repeat("- ", 300) + "1",
+			err:  "max nesting level reached",
+		},
+
+		{
+			name: "fail deeply chained and expression",
+			in:   "AliasForKeyword01 = 'foo'" + strings.Repeat(" and AliasForKeyword01 = 'foo'", 1000),
+			err:  "max ast depth reached",
+		},
+
+		{
+			name: "fail deeply chained or expression",
+			in:   "AliasForKeyword01 = 'foo'" + strings.Repeat(" or AliasForKeyword01 = 'foo'", 1000),
+			err:  "max ast depth reached",
+		},
+
+		{
+			name: "fail deeply chained union",
+			in:   "AliasForKeyword01 = 'foo'" + strings.Repeat(" union select * from table1", 1000),
+			err:  "max ast depth reached",
 		},
 	}
 

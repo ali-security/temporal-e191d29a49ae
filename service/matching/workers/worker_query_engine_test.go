@@ -2,6 +2,7 @@ package workers
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -521,4 +522,56 @@ func TestWorkerQueryEngine_IsExprRejectsUnsupportedOperators(t *testing.T) {
 	_, err = engine.EvaluateWorker(hb)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not supported")
+}
+
+// Deeply nested or chained expressions produce ASTs deep enough to overflow the
+// goroutine stack when traversed recursively; the parser must reject them.
+func TestWorkerQueryEngine_RejectsDeeplyNestedQuery(t *testing.T) {
+	cond := fmt.Sprintf("%s = 'task_queue'", workerTaskQueueColName)
+	tests := []struct {
+		name          string
+		query         string
+		expectedError string
+	}{
+		{
+			name:          "nested NOT",
+			query:         strings.Repeat("NOT ", 300) + cond,
+			expectedError: "max nesting level reached",
+		},
+		{
+			name:          "nested tilde",
+			query:         fmt.Sprintf("%s = %s1", workerTaskQueueColName, strings.Repeat("~", 300)),
+			expectedError: "max nesting level reached",
+		},
+		{
+			name:          "nested minus",
+			query:         fmt.Sprintf("%s = %s1", workerTaskQueueColName, strings.Repeat("- ", 300)),
+			expectedError: "max nesting level reached",
+		},
+		{
+			name:          "chained AND",
+			query:         cond + strings.Repeat(" AND "+cond, 1000),
+			expectedError: "max ast depth reached",
+		},
+		{
+			name:          "chained OR",
+			query:         cond + strings.Repeat(" OR "+cond, 1000),
+			expectedError: "max ast depth reached",
+		},
+		{
+			name:          "chained UNION",
+			query:         cond + strings.Repeat(" UNION SELECT * FROM table1", 1000),
+			expectedError: "max ast depth reached",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			engine, err := newWorkerQueryEngine("nsID", tt.query)
+			require.Error(t, err)
+			assert.Nil(t, engine)
+			assert.Contains(t, err.Error(), malformedSqlQueryErrMessage)
+			assert.Contains(t, err.Error(), tt.expectedError)
+		})
+	}
 }
